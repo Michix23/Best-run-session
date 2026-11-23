@@ -1,117 +1,101 @@
-{%- if comments -%}
-/**
- * Include the Geode headers.
- */
-{% endif -%}
 #include <Geode/Geode.hpp>
-{% if comments %}
-/**
- * Brings cocos2d and all Geode namespaces to the current scope.
- */
-{%- endif %}
+#include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/PauseLayer.hpp>
+#include <algorithm>
+#include <map>
+#include <sstream>
+
 using namespace geode::prelude;
-{% if comments %}
-/**
- * `$modify` lets you extend and modify GD's classes.
- * To hook a function in Geode, simply $modify the class
- * and write a new function definition with the signature of
- * the function you want to hook.
- *
- * Here we use the overloaded `$modify` macro to set our own class name,
- * so that we can use it for button callbacks.
- *
- * Notice the header being included, you *must* include the header for
- * the class you are modifying, or you will get a compile error.
- *
- * Another way you could do this is like this:
- *
- * struct MyMenuLayer : Modify<MyMenuLayer, MenuLayer> {};
- */
-{%- endif %}
-#include <Geode/modify/MenuLayer.hpp>
-class $modify(MyMenuLayer, MenuLayer) {
-{%- if comments %}
-	/**
-	 * Typically classes in GD are initialized using the `init` function, (though not always!),
-	 * so here we use it to add our own button to the bottom menu.
-	 *
-	 * Note that for all hooks, your signature has to *match exactly*,
-	 * `void init()` would not place a hook!
-	*/
-{%- endif %}
-	bool init() {
-{%- if comments %}
-		/**
-		 * We call the original init function so that the
-		 * original class is properly initialized.
-		 */
-{%- endif %}
-		if (!MenuLayer::init()) {
-			return false;
-		}
-{% if comments %}
-		/**
-		 * You can use methods from the `geode::log` namespace to log messages to the console,
-		 * being useful for debugging and such. See this page for more info about logging:
-		 * https://docs.geode-sdk.org/tutorials/logging
-		*/
-{%- endif %}
-		log::debug("Hello from my MenuLayer::init hook! This layer has {} children.", this->getChildrenCount());
-{% if comments %}
-		/**
-		 * See this page for more info about buttons
-		 * https://docs.geode-sdk.org/tutorials/buttons
-		*/
-{%- endif %}
-		auto myButton = CCMenuItemSpriteExtra::create(
-			CCSprite::createWithSpriteFrameName("GJ_likeBtn_001.png"),
-			this,
-{%- if comments %}
-			/**
-			 * Here we use the name we set earlier for our modify class.
-			*/
-{%- endif %}
-			menu_selector(MyMenuLayer::onMyButton)
-		);
-{% if comments %}
-		/**
-		 * Here we access the `bottom-menu` node by its ID, and add our button to it.
-		 * Node IDs are a Geode feature, see this page for more info about it:
-		 * https://docs.geode-sdk.org/tutorials/nodetree
-		*/
-{%- endif %}
-		auto menu = this->getChildByID("bottom-menu");
-		menu->addChild(myButton);
-{% if comments %}
-		/**
-		 * The `_spr` string literal operator just prefixes the string with
-		 * your mod id followed by a slash. This is good practice for setting your own node ids.
-		*/
-{%- endif %}
-		myButton->setID("my-button"_spr);
-{% if comments %}
-		/**
-		 * We update the layout of the menu to ensure that our button is properly placed.
-		 * This is yet another Geode feature, see this page for more info about it:
-		 * https://docs.geode-sdk.org/tutorials/layouts
-		*/
-{%- endif %}
-		menu->updateLayout();
-{% if comments %}
-		/**
-		 * We return `true` to indicate that the class was properly initialized.
-		 */
-{%- endif %}
-		return true;
-	}
-{% if comments %}
-	/**
-	 * This is the callback function for the button we created earlier.
-	 * The signature for button callbacks must always be the same,
-	 * return type `void` and taking a `CCObject*`.
-	*/
-{%- endif %}
-	void onMyButton(CCObject*) {
-		FLAlertLayer::create("Geode", "Hello from my custom mod!", "OK")->show();
-	}
+
+struct Run {
+    int percent;
+    int attempt;
+};
+
+// level key -> best runs of this launch (resets when GD closes)
+static std::map<std::string, std::vector<Run>> s_runs;
+
+static std::string levelKey(GJGameLevel* lvl) {
+    // id + name so local/editor levels (id 0) don't all share one list
+    return std::to_string(lvl->m_levelID.value()) + ":" + std::string(lvl->m_levelName);
+}
+
+static bool shouldIgnore(PlayLayer* pl) {
+    return pl->m_isPracticeMode || pl->m_isTestMode || pl->m_startPosObject;
+}
+
+static void recordRun(PlayLayer* pl, int percent) {
+    if (percent <= 0) return;
+
+    auto& runs = s_runs[levelKey(pl->m_level)];
+    int attempt = pl->m_attempts;
+
+    // skip if this attempt was already recorded (in case destroyPlayer fires twice)
+    for (auto& r : runs) if (r.attempt == attempt) return;
+
+    int oldBest = runs.empty() ? 0 : runs.front().percent;
+
+    runs.push_back({ percent, attempt });
+    std::sort(runs.begin(), runs.end(),
+        [](Run& a, Run& b) { return a.percent > b.percent; });
+    if (runs.size() > 10) runs.resize(10);
+
+    if (percent > oldBest) {
+        Notification::create("New best: " + std::to_string(percent) + "%")->show();
+    }
+}
+
+class $modify(RunSaverPlayLayer, PlayLayer) {
+    void destroyPlayer(PlayerObject* player, GameObject* obj) {
+        PlayLayer::destroyPlayer(player, obj);
+        if (player != m_player1 || shouldIgnore(this)) return;
+        recordRun(this, static_cast<int>(this->getCurrentPercent()));
+    }
+
+    void levelComplete() {
+        PlayLayer::levelComplete();
+        if (shouldIgnore(this)) return;
+        recordRun(this, 100);
+    }
+};
+
+class $modify(RunSaverPause, PauseLayer) {
+    void customSetup() {
+        PauseLayer::customSetup();
+
+        auto spr = ButtonSprite::create("Runs");
+        spr->setScale(0.7f);
+        auto btn = CCMenuItemSpriteExtra::create(
+            spr, this, menu_selector(RunSaverPause::onRuns));
+
+        if (auto menu = this->getChildByID("right-button-menu")) {
+            menu->addChild(btn);
+            menu->updateLayout();
+        } else {
+            auto menu = CCMenu::create();
+            menu->addChild(btn);
+            auto win = CCDirector::sharedDirector()->getWinSize();
+            menu->setPosition({ win.width - 50.f, 40.f });
+            this->addChild(menu);
+        }
+    }
+
+    void onRuns(CCObject*) {
+        auto pl = PlayLayer::get();
+        if (!pl) return;
+
+        std::string title = std::string(pl->m_level->m_levelName) + " - session runs";
+        std::stringstream ss;
+
+        auto it = s_runs.find(levelKey(pl->m_level));
+        if (it == s_runs.end() || it->second.empty()) {
+            ss << "No runs saved for this level yet.";
+        } else {
+            int i = 1;
+            for (auto& r : it->second) {
+                ss << i++ << ". **" << r.percent << "%** (attempt " << r.attempt << ")\n\n";
+            }
+        }
+        MDPopup::create(title.c_str(), ss.str(), "OK")->show();
+    }
 };
